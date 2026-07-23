@@ -29,6 +29,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **MediaPipe version note:** this project deliberately pins MediaPipe to `0.10.21`. Newer MediaPipe releases removed the `mp.solutions` Pose interface used by this controller. If you installed dependencies before this fix, reinstall them in the same environment:
+>
+> ```bash
+> pip uninstall -y mediapipe
+> pip install -r requirements.txt
+> ```
+
+> **MediaPipe version note:** this project deliberately pins MediaPipe to `0.10.21`. Newer MediaPipe releases removed the `mp.solutions` Pose interface used by this controller. If you installed dependencies before this fix, reinstall them in the same environment:
+>
+> ```bash
+> pip uninstall -y mediapipe
+> pip install -r requirements.txt
+> ```
+
 If `ydotoold.service` does not exist, start the installed `ydotoold` daemon according to your package's documentation. The daemon needs permission to access `/dev/uinput`; an input-injection command that fails generally indicates a daemon or permissions issue, not a gesture-tracking issue.
 
 For an **X11** Plasma session, install `xdotool` instead and pass `--backend xdotool`:

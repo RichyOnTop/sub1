@@ -1,2 +1,3 @@
 opencv-python>=4.8
-mediapipe>=0.10.14
+# 0.10.30+ removed the legacy mp.solutions Pose API used by this program.
+mediapipe==0.10.21
