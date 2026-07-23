@@ -9,15 +9,19 @@ from __future__ import annotations
 import argparse
 import collections
 import logging
+import os
 import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 # Pose landmark indexes (kept as integers so this also works across MediaPipe APIs).
 NOSE, LEFT_SHOULDER, RIGHT_SHOULDER = 0, 11, 12
@@ -99,7 +103,7 @@ def read_body(landmarks):
     except IndexError:
         return None
     required = (ls, rs, lh, rh, lw, rw, nose)
-    if any(p.visibility < 0.55 for p in required):
+    if any(getattr(p, "visibility", 1.0) < 0.55 for p in required):
         return None
     sx, sy = midpoint(ls, rs)
     hx, hy = midpoint(lh, rh)
@@ -107,6 +111,41 @@ def read_body(landmarks):
     # one-handed wave being mistaken for a jump.
     arms_up = lw.y < nose.y and rw.y < nose.y
     return abs(hy - sy), (sx + hx) / 2, arms_up
+
+
+MODEL_URL = ("https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+             "pose_landmarker_full/float16/latest/pose_landmarker_full.task")
+
+
+def ensure_model(model_path: str) -> str:
+    """Download the official Pose Landmarker model once, if it is absent."""
+    path = os.path.expanduser(model_path)
+    if os.path.isfile(path):
+        return path
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    temporary = path + ".download"
+    logging.info("Downloading MediaPipe pose model (first run only)…")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, temporary)
+        os.replace(temporary, path)
+    except OSError as exc:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise RuntimeError(
+            f"Could not download the pose model: {exc}. Download it from {MODEL_URL} "
+            f"and pass its path with --model."
+        ) from exc
+    return path
+
+
+def draw_landmarks(frame, landmarks) -> None:
+    """Lightweight landmark overlay; Tasks API has no legacy drawing_utils."""
+    height, width = frame.shape[:2]
+    for point in landmarks:
+        if getattr(point, "visibility", 1.0) >= 0.55:
+            cv2.circle(frame, (int(point.x * width), int(point.y * height)), 3, (0, 220, 0), -1)
 
 
 def main() -> int:
@@ -120,6 +159,8 @@ def main() -> int:
     parser.add_argument("--hold-ms", type=int, default=40, help="Key hold duration for xdotool")
     parser.add_argument("--swap-horizontal", action="store_true", help="Swap left and right if your camera direction is reversed")
     parser.add_argument("--no-preview", action="store_true", help="Do not show the camera window")
+    default_model = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "subway-motion-control", "pose_landmarker_full.task")
+    parser.add_argument("--model", default=default_model, help="Path to Pose Landmarker .task model (downloaded automatically if absent)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -133,14 +174,26 @@ def main() -> int:
         print(f"error: cannot open camera {args.camera}", file=sys.stderr)
         return 2
 
+    try:
+        model_path = ensure_model(args.model)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        cap.release()
+        return 2
+    options = vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=model_path),
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.65,
+        min_tracking_confidence=0.65,
+    )
     cal = Calibration([], [], time.monotonic(), args.calibrate_seconds)
     history: collections.deque[str] = collections.deque(maxlen=4)
     last_key_time = 0.0
-    mp_pose = mp.solutions.pose
-    drawing = mp.solutions.drawing_utils
+    timestamp_ms = 0
     logging.info("Stand normally for %.1f seconds to calibrate. Focus the game after calibration.", args.calibrate_seconds)
 
-    with mp_pose.Pose(model_complexity=1, min_detection_confidence=0.65, min_tracking_confidence=0.65) as pose:
+    with vision.PoseLandmarker.create_from_options(options) as pose:
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -148,9 +201,12 @@ def main() -> int:
                 break
             frame = cv2.flip(frame, 1)  # intuitive preview; see --swap-horizontal if needed
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = pose.process(rgb)
+            timestamp_ms += 33  # strictly increasing timestamp for Tasks VIDEO mode
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = pose.detect_for_video(image, timestamp_ms)
             action = None
-            body = read_body(result.pose_landmarks.landmark) if result.pose_landmarks else None
+            landmarks = result.pose_landmarks[0] if result.pose_landmarks else None
+            body = read_body(landmarks) if landmarks else None
             if body:
                 torso, center_x, arms_up = body
                 if not cal.add(torso, center_x):
@@ -169,8 +225,8 @@ def main() -> int:
                     if args.swap_horizontal and action in ("left", "right"):
                         action = "left" if action == "right" else "right"
                     label = f"Gesture: {action or 'neutral'}"
-                if result.pose_landmarks:
-                    drawing.draw_landmarks(frame, result.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+                if landmarks:
+                    draw_landmarks(frame, landmarks)
             else:
                 label = "Body not fully visible"
 
