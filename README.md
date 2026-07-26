@@ -77,7 +77,34 @@ python subway_motion_control.py --crouch-ratio 0.80 --backend sendinput
 
 The program requires a full upper body in view: face, shoulders, hips, and both wrists. It emits a short key tap only after a gesture is stable over several frames and then enforces a 0.55-second cooldown, avoiding repeated actions while a pose is held. Increase `--cooldown` if the game still gets duplicate moves.
 
+## Low-end hardware / laggy response
+
+By default the controller is already tuned for weaker CPUs: it uses the fast `lite` pose model, captures at 640×480, downscales frames to 320px wide before running pose detection, and always reads the newest available camera frame from a background thread (rather than blocking the whole loop on each `cap.read()`). Together these stop the input lag from compounding over time, which is the usual cause of a delay that keeps growing the longer you play.
+
+If you still see rising lag or a very "behind" response, try, in order:
+
+```powershell
+# Shrink the pose-detection frame further (default 320; try 240 or 160)
+python subway_motion_control.py --process-width 240 --backend sendinput
+
+# Capture at an even lower camera resolution (needs your webcam to support it)
+python subway_motion_control.py --camera-width 480 --camera-height 360 --backend sendinput
+
+# Skip the preview window entirely, which also costs CPU/GPU time to draw
+python subway_motion_control.py --no-preview --backend sendinput
+```
+
+Also worth doing on the Windows side:
+
+- Close other apps that use the camera or CPU heavily (Teams, Zoom, browser tabs playing video, etc.) while running the controller.
+- Lower your webcam's native capture resolution in the Windows Camera app or manufacturer software; a high-resolution webcam feed costs more per frame even before `--camera-width`/`--camera-height` are applied.
+- Plug in a laptop that's on battery — Windows' power-saving mode can throttle the CPU significantly.
+- If lag still grows over many minutes, it usually means your CPU can't keep up with pose detection at all; `--model-variant lite --process-width 160` is the fastest combination this script supports.
+
+`--model-variant full` or `--model-variant heavy` are available if your hardware is capable and you want more accurate tracking, but they are slower and not recommended on low-end machines.
+
 ## Troubleshooting
+
 
 - **No preview / camera cannot open:** close other apps using the webcam (Camera app, Teams, Zoom); check Windows Settings → Privacy & security → Camera → "Let desktop apps access your camera" is on; test `--camera 1`; try `--camera-backend dshow` or `--camera-backend msmf`.
 - **`ModuleNotFoundError`:** activate `.venv` (`.venv\Scripts\Activate.ps1`) and run `pip install -r requirements.txt`.

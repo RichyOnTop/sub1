@@ -12,6 +12,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 import time
 import urllib.request
 from ctypes import wintypes
@@ -169,22 +170,32 @@ def read_body(landmarks):
     return abs(hy - sy), (sx + hx) / 2, arms_up
 
 
-MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
-)
+MODEL_VARIANT_URLS = {
+    "lite": (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+    ),
+    "full": (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_full/float16/latest/pose_landmarker_full.task"
+    ),
+    "heavy": (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
+    ),
+}
 
 
-def default_model_path() -> str:
+def default_model_path(variant: str) -> str:
     """Pick a sensible per-user cache location for the downloaded model."""
     if IS_WINDOWS:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     else:
         base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
-    return os.path.join(base, "subway-motion-control", "pose_landmarker_full.task")
+    return os.path.join(base, "subway-motion-control", f"pose_landmarker_{variant}.task")
 
 
-def ensure_model(model_path: str) -> str:
+def ensure_model(model_path: str, variant: str) -> str:
     """Download the official Pose Landmarker model once, if it is absent."""
     path = os.path.expanduser(model_path)
     if os.path.isfile(path):
@@ -193,7 +204,7 @@ def ensure_model(model_path: str) -> str:
     temporary = path + ".download"
     logging.info("Downloading MediaPipe pose model (first run only)...")
     try:
-        urllib.request.urlretrieve(MODEL_URL, temporary)
+        urllib.request.urlretrieve(MODEL_VARIANT_URLS[variant], temporary)
         os.replace(temporary, path)
     except OSError as exc:
         try:
@@ -201,10 +212,11 @@ def ensure_model(model_path: str) -> str:
         except FileNotFoundError:
             pass
         raise RuntimeError(
-            f"Could not download the pose model: {exc}. Download it from {MODEL_URL} "
-            f"and pass its path with --model."
+            f"Could not download the pose model: {exc}. Download it from "
+            f"{MODEL_VARIANT_URLS[variant]} and pass its path with --model."
         ) from exc
     return path
+
 
 
 def draw_landmarks(frame, landmarks) -> None:
@@ -215,14 +227,71 @@ def draw_landmarks(frame, landmarks) -> None:
             cv2.circle(frame, (int(point.x * width), int(point.y * height)), 3, (0, 220, 0), -1)
 
 
-def open_camera(index: int, backend: str) -> cv2.VideoCapture:
+def open_camera(index: int, backend: str, width: int, height: int) -> cv2.VideoCapture:
     """Open the webcam, preferring DirectShow on Windows for faster/steadier init."""
     api_preference = {
         "any": cv2.CAP_ANY,
         "dshow": cv2.CAP_DSHOW,
         "msmf": cv2.CAP_MSMF,
     }[backend]
-    return cv2.VideoCapture(index, api_preference)
+    cap = cv2.VideoCapture(index, api_preference)
+    if width:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    if height:
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    # Ask the driver to keep only the newest frame internally. Most Windows
+    # backends (DirectShow/MSMF) ignore this, which is why FreshFrameReader
+    # below is the real fix for growing lag on slow hardware.
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+class FreshFrameReader:
+    """Continuously grab frames on a background thread and only ever hand out
+    the newest one.
+
+    Without this, a slow pose-detection step can't keep up with the camera's
+    capture rate. OpenCV/the OS then queue up frames, and the main loop keeps
+    processing older and older buffered frames -- the lag grows without
+    bound over time (this is what produces a multi-second, ever-increasing
+    delay on slower hardware). Reading in a dedicated thread and always
+    discarding all but the latest frame keeps the controller reacting to
+    "now", at the cost of only pose-detection speed, not the camera's frame
+    rate.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._frame = None
+        self._ok = False
+        self._frame_id = 0
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stopped:
+            ok, frame = self._cap.read()
+            with self._lock:
+                self._ok, self._frame = ok, frame
+                if ok:
+                    self._frame_id += 1
+            if not ok:
+                time.sleep(0.05)
+
+    def read(self):
+        """Return (ok, frame, frame_id). frame_id lets callers detect and skip
+        a frame they've already processed, instead of burning CPU redoing
+        pose detection on the same image while waiting for the next capture.
+        """
+        with self._lock:
+            return self._ok, self._frame, self._frame_id
+
+    def stop(self) -> None:
+        self._stopped = True
+        self._thread.join(timeout=1)
+
 
 
 def main() -> int:
@@ -243,7 +312,23 @@ def main() -> int:
     parser.add_argument("--hold-ms", type=int, default=40, help="Key hold duration in milliseconds")
     parser.add_argument("--swap-horizontal", action="store_true", help="Swap left and right if your camera direction is reversed")
     parser.add_argument("--no-preview", action="store_true", help="Do not show the camera window")
-    parser.add_argument("--model", default=default_model_path(), help="Path to Pose Landmarker .task model (downloaded automatically if absent)")
+    parser.add_argument(
+        "--model-variant",
+        choices=("lite", "full", "heavy"),
+        default="lite",
+        help="Pose model to use. 'lite' is fastest and is the default because it "
+        "runs well on low-end hardware; 'full'/'heavy' are more accurate but slower.",
+    )
+    parser.add_argument("--model", default=None, help="Path to a specific Pose Landmarker .task model (downloaded automatically if absent)")
+    parser.add_argument("--camera-width", type=int, default=640, help="Requested camera capture width (lower = faster on weak hardware)")
+    parser.add_argument("--camera-height", type=int, default=480, help="Requested camera capture height (lower = faster on weak hardware)")
+    parser.add_argument(
+        "--process-width",
+        type=int,
+        default=320,
+        help="Frame is downscaled to this width before pose detection (preview stays full size). "
+        "Lower is faster but less precise; use 0 to disable downscaling.",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
@@ -252,15 +337,18 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    cap = open_camera(args.camera, args.camera_backend)
+    cap = open_camera(args.camera, args.camera_backend, args.camera_width, args.camera_height)
     if not cap.isOpened():
         print(f"error: cannot open camera {args.camera}", file=sys.stderr)
         return 2
+    reader = FreshFrameReader(cap)
 
+    model_path = args.model or default_model_path(args.model_variant)
     try:
-        model_path = ensure_model(args.model)
+        model_path = ensure_model(model_path, args.model_variant)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        reader.stop()
         cap.release()
         return 2
     options = vision.PoseLandmarkerOptions(
@@ -273,18 +361,42 @@ def main() -> int:
     cal = Calibration([], [], time.monotonic(), args.calibrate_seconds)
     history: collections.deque[str] = collections.deque(maxlen=4)
     last_key_time = 0.0
-    timestamp_ms = 0
+    start_time = time.monotonic()
+    last_processed_ok = False
+    last_frame_id = -1
     logging.info("Stand normally for %.1f seconds to calibrate. Focus the game after calibration.", args.calibrate_seconds)
 
     with vision.PoseLandmarker.create_from_options(options) as pose:
         while True:
-            ok, frame = cap.read()
-            if not ok:
+            ok, frame, frame_id = reader.read()
+            if not ok or frame is None:
+                if not last_processed_ok:
+                    time.sleep(0.01)
+                    continue
                 logging.error("Camera frame could not be read")
                 break
+            last_processed_ok = True
+            if frame_id == last_frame_id:
+                # Already processed this exact camera frame; avoid burning
+                # CPU redoing pose detection before a new frame arrives.
+                time.sleep(0.002)
+                continue
+            last_frame_id = frame_id
             frame = cv2.flip(frame, 1)  # intuitive preview; see --swap-horizontal if needed
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            timestamp_ms += 33  # strictly increasing timestamp for Tasks VIDEO mode
+
+
+            # Detect on a downscaled copy so slow hardware keeps up; the
+            # preview window still shows the full-resolution frame.
+            if args.process_width and frame.shape[1] > args.process_width:
+                scale = args.process_width / frame.shape[1]
+                small = cv2.resize(frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            else:
+                small = frame
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            # Real elapsed time, not a fixed per-frame increment, so the
+            # VIDEO-mode timestamp reflects actual capture time even when
+            # frames arrive irregularly on slower hardware.
+            timestamp_ms = max(1, int((time.monotonic() - start_time) * 1000))
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             result = pose.detect_for_video(image, timestamp_ms)
             action = None
@@ -316,6 +428,7 @@ def main() -> int:
             # Require the same gesture on 3 of the last 4 camera frames, then
             # use cooldown so holding a pose is one game action rather than spam.
             history.append(action or "")
+
             stable = action and history.count(action) >= 3
             if stable and time.monotonic() - last_key_time >= args.cooldown:
                 sender.tap(action)
@@ -328,9 +441,11 @@ def main() -> int:
                 cv2.imshow("Subway Motion Control", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
+    reader.stop()
     cap.release()
     cv2.destroyAllWindows()
     return 0
+
 
 
 if __name__ == "__main__":
