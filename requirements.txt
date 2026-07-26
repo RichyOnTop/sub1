@@ -1,0 +1,6 @@
+opencv-python>=4.8
+# Uses MediaPipe's current Tasks API, not the removed mp.solutions API.
+mediapipe>=0.10.35,<0.11
+# Optional: only needed if you pass --backend pyautogui instead of the
+# built-in --backend sendinput.
+# pyautogui>=0.9.54
